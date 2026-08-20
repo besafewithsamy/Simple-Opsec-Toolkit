@@ -78,7 +78,7 @@ resolution) are intentionally left to manual testing.
 ## Limitations
 
 - Shredding is not guaranteed on SSDs or copy-on-write filesystems (Btrfs,
-  ZFS, APFS) — wear leveling and CoW mean the physical overwrite may not
+  ZFS, APFS)  wear leveling and CoW mean the physical overwrite may not
   land where the original data was.
 - DNS check is not a full leak test (no packet capture).
 - Username checks may be blocked or rate-limited by the target sites.
