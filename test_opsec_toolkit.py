@@ -3,10 +3,6 @@ Unit tests for opsec_toolkit.py
 
 Run with: pytest test_opsec_toolkit.py -v
 
-These focus on the pure / deterministic logic (path handling, port range
-parsing, scanning, shredding on tmp files). Network-dependent functions
-(footprint_check, DNS resolution) are exercised only where they can be
-tested without hitting the real network.
 """
 import socket
 import threading
@@ -17,9 +13,9 @@ import pytest
 import opsec_toolkit as tk
 
 
-# --------------------------------------------------------------------------
+ 
 # safe_out_path
-# --------------------------------------------------------------------------
+ 
 
 def test_safe_out_path_basic(tmp_path):
     src = tmp_path / "photo.jpg"
@@ -38,9 +34,9 @@ def test_safe_out_path_avoids_collision(tmp_path):
     assert not out.exists()
 
 
-# --------------------------------------------------------------------------
+ 
 # shred_file
-# --------------------------------------------------------------------------
+ 
 
 def test_shred_file_removes_file(tmp_path):
     f = tmp_path / "secret.txt"
@@ -62,9 +58,9 @@ def test_shred_empty_file(tmp_path):
     assert not f.exists()
 
 
-# --------------------------------------------------------------------------
+ 
 # port range parsing
-# --------------------------------------------------------------------------
+ 
 
 def test_parse_port_range_valid():
     assert tk.parse_port_range("1-5") == [1, 2, 3, 4, 5]
@@ -76,9 +72,9 @@ def test_parse_port_range_invalid(bad):
         tk.parse_port_range(bad)
 
 
-# --------------------------------------------------------------------------
+
 # port scanning (against a real local socket, no network needed)
-# --------------------------------------------------------------------------
+
 
 @pytest.fixture
 def local_listener():
@@ -95,15 +91,16 @@ def local_listener():
             try:
                 conn, _ = srv.accept()
                 conn.close()
-            except socket.timeout:
+            except (socket.timeout, OSError):
                 continue
 
     t = threading.Thread(target=accept_loop, daemon=True)
     t.start()
     yield port
     stop.set()
-    srv.close()
+  
     t.join(timeout=1)
+    srv.close()
 
 
 def test_scan_port_detects_open_port(local_listener):
@@ -111,7 +108,7 @@ def test_scan_port_detects_open_port(local_listener):
 
 
 def test_scan_port_detects_closed_port():
-    # Port 1 is virtually never open and doesn't require root to probe.
+
     assert tk.scan_port("127.0.0.1", 1, timeout=0.3) is False
 
 
@@ -121,9 +118,9 @@ def test_scan_ports_concurrent_finds_open_port(local_listener):
     assert open_ports == [local_listener]
 
 
-# --------------------------------------------------------------------------
+
 # DNS resolver dedup behavior
-# --------------------------------------------------------------------------
+
 
 def test_get_system_resolvers_dedupes(monkeypatch, tmp_path):
     fake_resolv = tmp_path / "resolv.conf"
