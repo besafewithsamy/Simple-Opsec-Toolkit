@@ -1,35 +1,81 @@
+#!/usr/bin/env python3
+"""
+OPSEC Toolkit
+Made by Sami Salhi
+
+A lightweight toolkit for everyday operational security tasks:
+metadata cleaning, secure-ish file shredding, DNS resolver diagnostics,
+username footprint checks, and a local TCP port scanner.
+
+Usage:
+    python opsec_toolkit.py                    # interactive menu (original behavior)
+    python opsec_toolkit.py clean FILE          # clean metadata from a file
+    python opsec_toolkit.py shred FILE [-p N] [-y]
+    python opsec_toolkit.py dns
+    python opsec_toolkit.py footprint USERNAME [-w N]
+    python opsec_toolkit.py scan [--host HOST] [--range START-END] [-w N] [-t SECONDS]
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
 import os
-import socket
-import random
 import platform
+import random
+import re
+import socket
 import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-def hr():
-    print("-" * 60)
+__version__ = "2.0.0"
 
-def clear_screen():
+
+
+def hr(char: str = "-", n: int = 60) -> None:
+    print(char * n)
+
+
+def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
+
 
 def prompt(msg: str) -> str:
     return input(msg).strip()
 
-def confirm(msg: str) -> bool:
-    ans = input(f"{msg} [y/N]: ").strip().lower()
+
+def confirm(msg: str, default: bool = False) -> bool:
+    hint = "Y/n" if default else "y/N"
+    ans = input(f"{msg} [{hint}]: ").strip().lower()
+    if not ans:
+        return default
     return ans in ("y", "yes")
+
 
 def is_file(path: str) -> bool:
     return Path(path).is_file()
 
+
 def safe_out_path(in_path: Path, prefix: str = "clean_") -> Path:
-    return in_path.with_name(prefix + in_path.name)
+    """Return a non-colliding output path so we never silently overwrite
+    a previous run's cleaned file."""
+    out = in_path.with_name(prefix + in_path.name)
+    counter = 1
+    while out.exists():
+        out = in_path.with_name(f"{prefix}{in_path.stem}_{counter}{in_path.suffix}")
+        counter += 1
+    return out
+
 
 def try_import(name: str):
     try:
         return __import__(name)
     except Exception:
         return None
+
 
 PIL = try_import("PIL")
 piexif = try_import("piexif")
@@ -38,20 +84,33 @@ docx_mod = try_import("docx")
 requests = try_import("requests")
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+LOSSY_IMAGE_EXTS = {".jpg", ".jpeg"}
 PDF_EXTS = {".pdf"}
 DOCX_EXTS = {".docx"}
 
-def clean_image_metadata(path: Path) -> Tuple[bool, str, Optional[Path]]:
+
+@dataclass
+class OpResult:
+    ok: bool
+    message: str
+    output: Optional[Path] = None
+
+#  metadata cleaner
+ 
+
+
+def clean_image_metadata(path: Path) -> OpResult:
     if not PIL:
-        return False, "Pillow is not installed ... Install: pip install pillow", None
+        return OpResult(False, "Pillow is not installed. Install: pip install pillow")
 
     try:
         from PIL import Image
 
-        out_path = safe_out_path(path, "clean_")
+        ext = path.suffix.lower()
+        out_path = safe_out_path(path)
         img = Image.open(path)
 
-        if img.mode in ("P", "RGBA") and path.suffix.lower() in (".jpg", ".jpeg"):
+        if img.mode in ("P", "RGBA") and ext in LOSSY_IMAGE_EXTS:
             img = img.convert("RGB")
 
         data = list(img.getdata())
@@ -59,48 +118,59 @@ def clean_image_metadata(path: Path) -> Tuple[bool, str, Optional[Path]]:
         clean.putdata(data)
 
         save_kwargs = {}
-        if path.suffix.lower() in (".jpg", ".jpeg"):
+        if ext in LOSSY_IMAGE_EXTS:
             save_kwargs["quality"] = 95
+            save_kwargs["optimize"] = True
+        elif ext == ".png":
             save_kwargs["optimize"] = True
 
         clean.save(out_path, **save_kwargs)
 
-        if piexif and out_path.suffix.lower() in (".jpg", ".jpeg"):
+        if piexif and ext in LOSSY_IMAGE_EXTS:
             try:
                 piexif.remove(str(out_path))
             except Exception:
                 pass
 
-        return True, "Done , Image metadata cleaned .", out_path
+        return OpResult(True, "Image metadata cleaned.", out_path)
     except Exception as e:
-        return False, f"cleaning image Failed: {e}", None
+        return OpResult(False, f"Cleaning image failed: {e}")
 
-def clean_pdf_metadata(path: Path) -> Tuple[bool, str, Optional[Path]]:
+
+def clean_pdf_metadata(path: Path) -> OpResult:
     if not pypdf:
-        return False, "pypdf is not installed .... Install: pip install pypdf", None
+        return OpResult(False, "pypdf is not installed. Install: pip install pypdf")
 
     try:
         from pypdf import PdfReader, PdfWriter
 
         reader = PdfReader(str(path))
         writer = PdfWriter()
-
         for page in reader.pages:
             writer.add_page(page)
 
         writer.add_metadata({})
 
-        out_path = safe_out_path(path, "clean_")
+      
+        try:
+            root = writer._root_object
+            if "/Metadata" in root:
+                del root["/Metadata"]
+        except Exception:
+            pass
+
+        out_path = safe_out_path(path)
         with open(out_path, "wb") as f:
             writer.write(f)
 
-        return True, "Done, PDF metadata cleaned.", out_path
+        return OpResult(True, "PDF metadata cleaned (incl. XMP, if present).", out_path)
     except Exception as e:
-        return False, f"cleaning PDF Failed: {e}", None
+        return OpResult(False, f"Cleaning PDF failed: {e}")
 
-def clean_docx_metadata(path: Path) -> Tuple[bool, str, Optional[Path]]:
+
+def clean_docx_metadata(path: Path) -> OpResult:
     if not docx_mod:
-        return False, "python-docx is not installed ... Install: pip install python-docx", None
+        return OpResult(False, "python-docx is not installed. Install: pip install python-docx")
 
     try:
         import docx
@@ -108,56 +178,65 @@ def clean_docx_metadata(path: Path) -> Tuple[bool, str, Optional[Path]]:
         doc = docx.Document(str(path))
         props = doc.core_properties
 
-        props.author = ""
-        props.last_modified_by = ""
-        props.title = ""
-        props.subject = ""
-        props.keywords = ""
-        props.comments = ""
-        props.category = ""
-        props.content_status = ""
-        props.identifier = ""
-        props.language = ""
-        props.version = ""
+        for field in (
+            "author", "last_modified_by", "title", "subject", "keywords",
+            "comments", "category", "content_status", "identifier",
+            "language", "version",
+        ):
+            try:
+                setattr(props, field, "")
+            except Exception:
+                pass
 
-        out_path = safe_out_path(path, "clean_")
+        out_path = safe_out_path(path)
         doc.save(str(out_path))
 
-        return True, "DOCX core properties cleaned", out_path
+        return OpResult(
+            True,
+            "DOCX core properties cleaned. Note: this does not strip "
+            "revision/rsid tracking data embedded in the XML - for that, "
+            "re-save via 'Save As' in Word/LibreOffice first.",
+            out_path,
+        )
     except Exception as e:
-        return False, f" cleaning DOCX Failed: {e}", None
+        return OpResult(False, f"Cleaning DOCX failed: {e}")
 
-def metadata_cleaner_menu():
+
+def clean_metadata(path: Path) -> OpResult:
+    ext = path.suffix.lower()
+    if ext in IMAGE_EXTS:
+        return clean_image_metadata(path)
+    if ext in PDF_EXTS:
+        return clean_pdf_metadata(path)
+    if ext in DOCX_EXTS:
+        return clean_docx_metadata(path)
+    return OpResult(False, f"Unsupported file extension: {ext} (supported: image, pdf, docx)")
+
+
+def metadata_cleaner_menu() -> None:
     hr()
     p = prompt("Enter path to the file (image/pdf/docx): ")
     if not is_file(p):
-        print("File not found , recheck again please")
+        print("File not found, please check the path.")
         return
 
-    path = Path(p)
-    ext = path.suffix.lower()
+    result = clean_metadata(Path(p))
+    print(result.message)
+    if result.ok and result.output:
+        print(f"Output: {result.output}")
 
-    if ext in IMAGE_EXTS:
-        ok, msg, outp = clean_image_metadata(path)
-    elif ext in PDF_EXTS:
-        ok, msg, outp = clean_pdf_metadata(path)
-    elif ext in DOCX_EXTS:
-        ok, msg, outp = clean_docx_metadata(path)
-    else:
-        print(f"Unsupported file extension: {ext}")
-        print("Supported: extensions are (jpg/png/webp/tiff), pdf, docx")
-        return
 
-    print(msg)
-    if ok and outp:
-        print(f"Output: {outp}")
 
-def shred_file(path: Path, passes: int = 3) -> Tuple[bool, str]:
+# 2) shredder
+
+
+
+def shred_file(path: Path, passes: int = 3) -> OpResult:
     try:
         size = path.stat().st_size
         if size == 0:
             path.unlink()
-            return True, "File was empty; deleted"
+            return OpResult(True, "File was empty; deleted.")
 
         try:
             os.chmod(path, 0o600)
@@ -171,22 +250,25 @@ def shred_file(path: Path, passes: int = 3) -> Tuple[bool, str]:
                 f.flush()
                 os.fsync(f.fileno())
 
-        rnd_name = path.with_name("." + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(12)))
+        rnd_name = path.with_name(
+            "." + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(12))
+        )
         try:
             path.rename(rnd_name)
             rnd_name.unlink()
         except Exception:
             path.unlink()
 
-        return True, f"Shredded done with {passes} pass(es) and deleted."
+        return OpResult(True, f"Shredded with {passes} pass(es) and deleted.")
     except Exception as e:
-        return False, f"Shred failed {e}"
+        return OpResult(False, f"Shred failed: {e}")
 
-def shredder_menu():
+
+def shredder_menu() -> None:
     hr()
     p = prompt("Enter path to file to shred: ")
     if not is_file(p):
-        print("Are u sure? File not found.")
+        print("File not found.")
         return
 
     passes_str = prompt("Overwrite passes (default 3): ")
@@ -196,19 +278,24 @@ def shredder_menu():
             passes = max(1, int(passes_str))
         except Exception:
             print("Invalid number. Using default 3.")
-            passes = 3
 
-    print("INFO: In Some SSDs and some filesystems, shredding cannot be guaranteed sadly")
-    if not confirm("Continue?"):
+    print("INFO: on SSDs and copy-on-write filesystems (e.g. Btrfs, ZFS, APFS),")
+    print("overwrite-based shredding is not guaranteed to actually destroy the data.")
+    if not confirm(f"Shred and permanently delete '{p}'?"):
         return
 
-    ok, msg = shred_file(Path(p), passes=passes)
-    print(msg if ok else f"ERROR: {msg}")
+    result = shred_file(Path(p), passes=passes)
+    print(result.message if result.ok else f"ERROR: {result.message}")
+
+
+
+# 3) DNS diagnostics
+
 
 def get_system_resolvers() -> List[str]:
     resolvers: List[str] = []
-
     sysname = platform.system().lower()
+
     if sysname in ("linux", "darwin"):
         resolv = Path("/etc/resolv.conf")
         if resolv.exists():
@@ -220,24 +307,29 @@ def get_system_resolvers() -> List[str]:
                         resolvers.append(parts[1])
 
     elif sysname == "windows":
+      
         try:
             out = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
+            ip_re = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+            in_dns_block = False
             for line in out.splitlines():
                 if "DNS Servers" in line:
-                    ip = line.split(":")[-1].strip()
-                    if ip:
-                        resolvers.append(ip)
-                elif resolvers and line.strip() and line.startswith(" " * 10):
-                    ip = line.strip()
-                    if ip and any(c.isdigit() for c in ip):
-                        resolvers.append(ip)
+                    in_dns_block = True
+                elif line.strip() and not line.startswith((" ", "\t")):
+                    in_dns_block = False
+
+                if in_dns_block:
+                    m = ip_re.search(line)
+                    if m:
+                        resolvers.append(m.group(1))
         except Exception:
             pass
 
     return list(dict.fromkeys(resolvers))
 
-def resolve_test(domains: List[str]) -> List[Tuple[str, Optional[str], Optional[str]]]:
-    results: List[Tuple[str, Optional[str], Optional[str]]] = []
+
+def resolve_test(domains: Sequence[str]) -> List[Tuple[str, Optional[str], Optional[str]]]:
+    results = []
     for d in domains:
         try:
             ip = socket.gethostbyname(d)
@@ -246,9 +338,10 @@ def resolve_test(domains: List[str]) -> List[Tuple[str, Optional[str], Optional[
             results.append((d, None, str(e)))
     return results
 
-def dns_diagnostics_menu():
+
+def dns_diagnostics_menu() -> None:
     hr()
-    print("DNS diagnostics (Its not a DNS leak test, Don't Worry)")
+    print("DNS diagnostics (this is not a DNS leak test - no packet capture)")
 
     resolvers = get_system_resolvers()
     if resolvers:
@@ -256,19 +349,21 @@ def dns_diagnostics_menu():
         for r in resolvers:
             print(f"  - {r}")
     else:
-        print("I Could not reliably parse system resolvers")
+        print("Could not reliably parse system resolvers.")
 
     print()
     domains = ["example.com", "cloudflare.com", "google.com"]
     print("Testing resolution via system resolver path:")
     for d, ip, err in resolve_test(domains):
-        if err:
-            print(f"  {d}: ERROR {err}")
-        else:
-            print(f"  {d}: {ip}")
+        print(f"  {d}: ERROR {err}" if err else f"  {d}: {ip}")
 
-    print("\nIf you’re using a VPN, compare the resolver IPs above with your expected VPN DNS servers.")
-    print("I cannot confirm 'no DNS leak' from this output alone.")
+    print("\nIf you're using a VPN, compare the resolver IPs above with your expected VPN DNS servers.")
+    print("This cannot confirm 'no DNS leak' on its own.")
+
+
+
+# 4) username footprint checker (now concurrent)
+
 
 SITE_TEMPLATES = [
     ("GitHub", "https://github.com/{}"),
@@ -280,37 +375,62 @@ SITE_TEMPLATES = [
     ("Dev.to", "https://dev.to/{}"),
 ]
 
-def http_exists(url: str, timeout: int = 7) -> Tuple[Optional[bool], str]:
+
+@dataclass
+class FootprintResult:
+    site: str
+    url: str
+    exists: Optional[bool]  # True or False or None (unknown)
+    note: str
+
+
+def _check_site(session, username: str, site: str, tmpl: str, timeout: int = 7) -> FootprintResult:
+    url = tmpl.format(username)
     try:
-        if requests:
-            r = requests.get(
-                url,
-                timeout=timeout,
-                allow_redirects=True,
-                headers={"User-Agent": "opsec-toolkit/1.0"},
+        if session is not None:
+            r = session.get(
+                url, timeout=timeout, allow_redirects=True,
+                headers={"User-Agent": "opsec-toolkit/2.0"},
             )
+            code, final_url = r.status_code, r.url
+        else:
+            import urllib.request
 
-            if r.status_code == 200:
-                return True, f"200 OK ({r.url})"
-            if r.status_code == 404:
-                return False, "404 Not Found"
-            if r.status_code in (401, 403, 429):
-                return None, f"{r.status_code} Blocked/Rate-limited"
-            return None, f"{r.status_code} Unknown"
+            req = urllib.request.Request(url, headers={"User-Agent": "opsec-toolkit/2.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code, final_url = getattr(resp, "status", 200), url
 
-        import urllib.request
-
-        req = urllib.request.Request(url, headers={"User-Agent": "opsec-toolkit/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            code = getattr(resp, "status", 200)
-            if code == 200:
-                return True, "200 OK"
-            return None, f"{code} Unknown"
-
+        if code == 200:
+            return FootprintResult(site, url, True, f"200 OK ({final_url})")
+        if code == 404:
+            return FootprintResult(site, url, False, "404 Not Found")
+        if code in (401, 403, 429):
+            return FootprintResult(site, url, None, f"{code} Blocked/Rate-limited")
+        return FootprintResult(site, url, None, f"{code} Unknown")
     except Exception as e:
-        return None, f"Error/Blocked: {e}"
+        return FootprintResult(site, url, None, f"Error/Blocked: {e}")
 
-def footprint_menu():
+
+def footprint_check(username: str, max_workers: int = 5) -> List[FootprintResult]:
+    """Check a username against SITE_TEMPLATES concurrently.
+
+    max_workers is kept modest by default (5) - this is a small, fixed list
+    of sites, so there's no real speed reason to hammer them all at once,
+    and a lower concurrency is politer to the sites being checked.
+    """
+    session = requests.Session() if requests else None
+    results: List[FootprintResult] = []
+    with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_check_site, session, username, site, tmpl) for site, tmpl in SITE_TEMPLATES]
+        for fut in cf.as_completed(futures):
+            results.append(fut.result())
+
+    order = {site: i for i, (site, _) in enumerate(SITE_TEMPLATES)}
+    results.sort(key=lambda r: order[r.site])
+    return results
+
+
+def footprint_menu() -> None:
     hr()
     username = prompt("Enter username to check: ")
     if not username:
@@ -320,22 +440,19 @@ def footprint_menu():
     print(f"Checking footprint for: {username}")
     hr()
 
-    for site, tmpl in SITE_TEMPLATES:
-        url = tmpl.format(username)
-        exists, note = http_exists(url)
+    for r in footprint_check(username):
+        status = "FOUND" if r.exists is True else "NOT FOUND" if r.exists is False else "UNKNOWN"
+        print(f"{r.site:12} {status:10} {r.url}  |  {r.note}")
 
-        if exists is True:
-            status = "FOUND"
-        elif exists is False:
-            status = "NOT FOUND"
-        else:
-            status = "UNKNOWN"
+    print("\nNote: UNKNOWN often means the site blocked automated checks. This is not conclusive.")
 
-        print(f"{site:12} {status:10} {url}  |  {note}")
 
-    print("\nNote: UNKNOWN often means the site blocked automated checks. This is not conclusive")
+
+# 5) local port scanner (now concurrent)
+
 
 COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 587, 631, 8080, 8443, 3306, 5432, 6379, 27017]
+
 
 def scan_port(host: str, port: int, timeout: float = 0.4) -> bool:
     try:
@@ -345,12 +462,28 @@ def scan_port(host: str, port: int, timeout: float = 0.4) -> bool:
     except Exception:
         return False
 
-def local_scan_menu():
+
+def scan_ports(host: str, ports: Sequence[int], timeout: float = 0.4, max_workers: int = 100) -> List[int]:
+    open_ports: List[int] = []
+    workers = max(1, min(max_workers, len(ports)))
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(scan_port, host, p, timeout): p for p in ports}
+        for fut in cf.as_completed(futures):
+            p = futures[fut]
+            try:
+                if fut.result():
+                    open_ports.append(p)
+            except Exception:
+                pass
+    return sorted(open_ports)
+
+
+def local_scan_menu() -> None:
     hr()
     host = prompt("Host to scan (default 127.0.0.1): ") or "127.0.0.1"
     mode = prompt("Scan mode: 1) common ports  2) custom range  (default 1): ") or "1"
 
-    ports: List[int] = []
+    ports: List[int] = COMMON_PORTS
     if mode.strip() == "2":
         start = prompt("Start port (e.g., 1): ")
         end = prompt("End port (e.g., 1024): ")
@@ -362,8 +495,6 @@ def local_scan_menu():
         except Exception:
             print("Invalid range. Using common ports.")
             ports = COMMON_PORTS
-    else:
-        ports = COMMON_PORTS
 
     timeout_s = prompt("Timeout per port in seconds (default 0.4): ") or "0.4"
     try:
@@ -374,11 +505,7 @@ def local_scan_menu():
         timeout = 0.4
 
     print(f"\nScanning {host} on {len(ports)} port(s)...")
-    open_ports: List[int] = []
-
-    for p in ports:
-        if scan_port(host, p, timeout=timeout):
-            open_ports.append(p)
+    open_ports = scan_ports(host, ports, timeout=timeout)
 
     hr()
     if open_ports:
@@ -387,27 +514,31 @@ def local_scan_menu():
     else:
         print("No open ports found (or filtered).")
 
+
+
 MENU = {
     "1": ("Metadata cleaner (image/pdf/docx)", metadata_cleaner_menu),
-    "2": ("Shred file (it overwrite + delete)", shredder_menu),
-    "3": ("DNS diagnostics (not definitive leak test)", dns_diagnostics_menu),
-    "4": ("Username checker in other platforms", footprint_menu),
-    "5": ("Simple Local port scan", local_scan_menu),
+    "2": ("Shred file (overwrite + delete)", shredder_menu),
+    "3": ("DNS diagnostics (not a definitive leak test)", dns_diagnostics_menu),
+    "4": ("Username checker across platforms", footprint_menu),
+    "5": ("Simple local port scan", local_scan_menu),
     "0": ("Exit", None),
 }
 
-def show_deps():
-    print("dependencies status:")
+
+def show_deps() -> None:
+    print("Dependency status:")
     print(f"  pillow:      {'OK' if PIL else 'missing'}")
     print(f"  piexif:      {'OK' if piexif else 'missing'}")
     print(f"  pypdf:       {'OK' if pypdf else 'missing'}")
     print(f"  python-docx: {'OK' if docx_mod else 'missing'}")
     print(f"  requests:    {'OK' if requests else 'missing'}")
-    print("Install missing ones with: pip install pillow piexif pypdf python-docx requests")
+    print("Install missing ones with: pip install -r requirements.txt")
 
-def main():
+
+def run_menu() -> None:
     clear_screen()
-    print("OPSEC Toolkit")
+    print(f"OPSEC Toolkit v{__version__}")
     print("Made by Sami Salhi")
     show_deps()
 
@@ -417,7 +548,7 @@ def main():
             print(f"{k}. {MENU[k][0]}")
         hr()
 
-        choice = prompt("Please Choose an option: ")
+        choice = prompt("Please choose an option: ")
         if choice == "0":
             print("Bye <3.")
             break
@@ -430,6 +561,108 @@ def main():
                 clear_screen()
         else:
             print("Invalid choice.")
+
+
+def parse_port_range(spec: str) -> List[int]:
+    m = re.fullmatch(r"(\d+)-(\d+)", spec.strip())
+    if not m:
+        raise argparse.ArgumentTypeError("range must look like START-END, e.g. 1-1024")
+    a, b = int(m.group(1)), int(m.group(2))
+    if a < 1 or b > 65535 or a > b:
+        raise argparse.ArgumentTypeError("range must satisfy 1 <= START <= END <= 65535")
+    return list(range(a, b + 1))
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="opsec_toolkit.py",
+        description="OPSEC Toolkit - metadata cleaning, shredding, DNS diagnostics, "
+                     "username footprint checks, local port scanning.",
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = p.add_subparsers(dest="command")
+
+    clean_p = sub.add_parser("clean", help="Strip metadata from an image/pdf/docx file")
+    clean_p.add_argument("file", help="Path to the file")
+
+    shred_p = sub.add_parser("shred", help="Overwrite and delete a file")
+    shred_p.add_argument("file", help="Path to the file")
+    shred_p.add_argument("-p", "--passes", type=int, default=3, help="Overwrite passes (default 3)")
+    shred_p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+
+    sub.add_parser("dns", help="Show DNS resolver diagnostics")
+
+    fp_p = sub.add_parser("footprint", help="Check a username across common platforms")
+    fp_p.add_argument("username")
+    fp_p.add_argument("-w", "--workers", type=int, default=5, help="Concurrent requests (default 5)")
+
+    scan_p = sub.add_parser("scan", help="Scan TCP ports on a host")
+    scan_p.add_argument("--host", default="127.0.0.1")
+    scan_p.add_argument("--range", type=parse_port_range, dest="ports",
+                         help="Port range as START-END, e.g. 1-1024 (default: common ports)")
+    scan_p.add_argument("-w", "--workers", type=int, default=100, help="Concurrent connections (default 100)")
+    scan_p.add_argument("-t", "--timeout", type=float, default=0.4, help="Per-port timeout in seconds")
+
+    return p
+
+
+def run_cli(args: argparse.Namespace) -> int:
+    if args.command == "clean":
+        if not is_file(args.file):
+            print("File not found.")
+            return 1
+        result = clean_metadata(Path(args.file))
+        print(result.message)
+        if result.ok and result.output:
+            print(f"Output: {result.output}")
+        return 0 if result.ok else 1
+
+    if args.command == "shred":
+        if not is_file(args.file):
+            print("File not found.")
+            return 1
+        if not args.yes and not confirm(f"Shred and permanently delete '{args.file}'?"):
+            print("Aborted.")
+            return 1
+        result = shred_file(Path(args.file), passes=max(1, args.passes))
+        print(result.message if result.ok else f"ERROR: {result.message}")
+        return 0 if result.ok else 1
+
+    if args.command == "dns":
+        dns_diagnostics_menu()
+        return 0
+
+    if args.command == "footprint":
+        print(f"Checking footprint for: {args.username}")
+        hr()
+        for r in footprint_check(args.username, max_workers=max(1, args.workers)):
+            status = "FOUND" if r.exists is True else "NOT FOUND" if r.exists is False else "UNKNOWN"
+            print(f"{r.site:12} {status:10} {r.url}  |  {r.note}")
+        return 0
+
+    if args.command == "scan":
+        ports = args.ports or COMMON_PORTS
+        print(f"Scanning {args.host} on {len(ports)} port(s)...")
+        open_ports = scan_ports(args.host, ports, timeout=args.timeout, max_workers=args.workers)
+        if open_ports:
+            print("Open ports:", ", ".join(map(str, open_ports)))
+        else:
+            print("No open ports found (or filtered).")
+        return 0
+
+    return 1
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.command is None:
+        run_menu()
+        return
+
+    sys.exit(run_cli(args))
+
 
 if __name__ == "__main__":
     try:
