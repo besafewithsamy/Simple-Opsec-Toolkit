@@ -4,7 +4,7 @@ A lightweight command-line toolkit for everyday operational security tasks.
 
 Built to automate small but important privacy habits: removing metadata,
 securely deleting sensitive files, checking DNS configuration, scanning
-local exposure, and doing quick username checks — all in one script.
+local exposure, and doing quick username checks  all in one script.
 
 ## Features
 
@@ -21,7 +21,7 @@ local exposure, and doing quick username checks — all in one script.
 
 ```bash
 git clone https://github.com/itzj0eblack/Simple-Opsec-Toolkit.git
-cd opsec-toolkit
+cd Simple-Opsec-Toolkit
 pip install -r requirements.txt
 ```
 
@@ -49,11 +49,14 @@ python opsec_toolkit.py shred secret.txt -y          # skip confirmation
 # DNS resolver diagnostics
 python opsec_toolkit.py dns
 
-# Username footprint check
-python opsec_toolkit.py footprint someusername -w 5
+# Username footprint check (add -t for a custom per-site timeout)
+python opsec_toolkit.py footprint someusername -w 5 -t 10
 
-# Port scan
+# Port scan (range...)
 python opsec_toolkit.py scan --host 127.0.0.1 --range 1-1024 -w 200 -t 0.3
+
+# Port scan (...or an explicit list - output shows service names)
+python opsec_toolkit.py scan --host 127.0.0.1 --ports 22,80,443,3306
 ```
 
 Run `python opsec_toolkit.py --help` or `python opsec_toolkit.py <command> --help`
@@ -80,10 +83,17 @@ resolution) are intentionally left to manual testing.
 - Shredding is not guaranteed on SSDs or copy-on-write filesystems (Btrfs,
   ZFS, APFS)  wear leveling and CoW mean the physical overwrite may not
   land where the original data was.
-- DNS check is not a full leak test (no packet capture).
+- DNS check is not a full leak test (no packet capture). On
+  systemd-resolved systems the stub resolver (127.0.0.53) is shown
+  along with the real upstreams from
+  `/run/systemd/resolve/resolv.conf` when available.
 - Username checks may be blocked or rate-limited by the target sites.
+  Instagram and Twitter/X return 200 to anonymous requests even for
+  nonexistent users, so their "FOUND" results are marked unreliable
+  (checked anonymously they cannot be confirmed).
 - Port scanner is basic TCP connect-scan only (no SYN scan, no service
-  fingerprinting).
+  fingerprinting). Service names shown for open ports come from the
+  local IANA table (`getservbyport`), not from probing the service.
 - DOCX metadata cleaning clears core properties (author, title, etc.) but
   does not strip revision/rsid tracking data embedded in the document XML —
   re-save via "Save As" in Word/LibreOffice for that.
