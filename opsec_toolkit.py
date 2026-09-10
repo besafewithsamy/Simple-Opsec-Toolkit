@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 
@@ -104,27 +104,36 @@ def clean_image_metadata(path: Path) -> OpResult:
         return OpResult(False, "Pillow is not installed. Install: pip install pillow")
 
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         ext = path.suffix.lower()
         out_path = safe_out_path(path)
-        img = Image.open(path)
+        with Image.open(path) as img:
+            # Bake the EXIF orientation into the pixels, then drop the tag,
+            # so "clean" doesn't silently rotate the photo.
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
 
-        if img.mode in ("P", "RGBA") and ext in LOSSY_IMAGE_EXTS:
-            img = img.convert("RGB")
+            # JPEG can only hold RGB/L/CMYK - convert anything else first.
+            if ext in LOSSY_IMAGE_EXTS and img.mode not in ("RGB", "L", "CMYK"):
+                img = img.convert("RGB")
 
-        data = list(img.getdata())
-        clean = Image.new(img.mode, img.size)
-        clean.putdata(data)
+            # Rebuild from a fresh in-memory copy: strips info/icc profile
+            # without materializing every pixel into a Python list (the old
+            # list(getdata()) approach could eat ~1GB on a 12MP photo).
+            clean = img.copy()
+            clean.info = {}
 
-        save_kwargs = {}
-        if ext in LOSSY_IMAGE_EXTS:
-            save_kwargs["quality"] = 95
-            save_kwargs["optimize"] = True
-        elif ext == ".png":
-            save_kwargs["optimize"] = True
+            save_kwargs = {}
+            if ext in LOSSY_IMAGE_EXTS:
+                save_kwargs["quality"] = 95
+                save_kwargs["optimize"] = True
+            elif ext == ".png":
+                save_kwargs["optimize"] = True
 
-        clean.save(out_path, **save_kwargs)
+            clean.save(out_path, **save_kwargs)
 
         if piexif and ext in LOSSY_IMAGE_EXTS:
             try:
@@ -151,10 +160,11 @@ def clean_pdf_metadata(path: Path) -> OpResult:
 
         writer.add_metadata({})
 
-      
+        # Best-effort XMP removal. _root_object is private API - guard so a
+        # future pypdf release can't break cleaning entirely.
         try:
-            root = writer._root_object
-            if "/Metadata" in root:
+            root = getattr(writer, "_root_object", None)
+            if root is not None and "/Metadata" in root:
                 del root["/Metadata"]
         except Exception:
             pass
@@ -231,8 +241,16 @@ def metadata_cleaner_menu() -> None:
 
 
 
+SHRED_MAX_PASSES = 15  # anything above this is wasted time (and warns)
+
+
 def shred_file(path: Path, passes: int = 3) -> OpResult:
     try:
+        # Never follow a symlink: overwriting would destroy the *target*
+        # while the delete would only remove the link. Refuse instead.
+        if path.is_symlink():
+            return OpResult(False, "Refusing to shred a symlink (it points at another file).")
+
         size = path.stat().st_size
         if size == 0:
             path.unlink()
@@ -249,6 +267,11 @@ def shred_file(path: Path, passes: int = 3) -> OpResult:
                 f.write(os.urandom(size))
                 f.flush()
                 os.fsync(f.fileno())
+            # Wipe standards typically end with a truncate so the length
+            # itself isn't a leftover hint.
+            f.truncate(0)
+            f.flush()
+            os.fsync(f.fileno())
 
         rnd_name = path.with_name(
             "." + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(12))
@@ -278,6 +301,10 @@ def shredder_menu() -> None:
             passes = max(1, int(passes_str))
         except Exception:
             print("Invalid number. Using default 3.")
+    if passes > SHRED_MAX_PASSES:
+        print(f"NOTE: {passes} passes is overkill - wear leveling means extra passes add no "
+              f"security. Clamping to {SHRED_MAX_PASSES}.")
+        passes = SHRED_MAX_PASSES
 
     print("INFO: on SSDs and copy-on-write filesystems (e.g. Btrfs, ZFS, APFS),")
     print("overwrite-based shredding is not guaranteed to actually destroy the data.")
@@ -292,6 +319,50 @@ def shredder_menu() -> None:
 # 3) DNS diagnostics
 
 
+# Known public resolvers, for labeling output (not a leak test - just
+# answers "whose DNS am I actually using?" at a glance).
+RESOLVER_LABELS = {
+    "1.1.1.1": "Cloudflare", "1.0.0.1": "Cloudflare",
+    "8.8.8.8": "Google", "8.8.4.4": "Google",
+    "9.9.9.9": "Quad9", "149.112.112.112": "Quad9",
+    "94.140.14.14": "AdGuard", "94.140.15.15": "AdGuard",
+    "208.67.222.222": "OpenDNS", "208.67.220.220": "OpenDNS",
+    "185.228.168.9": "CleanBrowsing", "185.228.169.9": "CleanBrowsing",
+    "76.76.19.19": "Control D", "76.223.122.150": "Control D",
+    "0.0.0.0": "blocked/sinkholed",
+}
+
+
+def label_resolver(ip: str) -> str:
+    return RESOLVER_LABELS.get(ip, "")
+
+
+def _parse_resolv_conf(text: str) -> List[str]:
+    resolvers: List[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("nameserver"):
+            parts = line.split()
+            if len(parts) >= 2:
+                resolvers.append(parts[1])
+    return resolvers
+
+
+def _windows_resolvers_powershell() -> List[str]:
+    """Locale-independent DNS lookup via PowerShell; returns [] on failure."""
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-DnsClientServerAddress -AddressFamily IPv4 | "
+             "Select-Object -ExpandProperty ServerAddresses"],
+            text=True, errors="ignore", timeout=10,
+        )
+        ip_re = re.compile(r"^\b(\d{1,3}(?:\.\d{1,3}){3})\b\s*$")
+        return [m.group(1) for line in out.splitlines() if (m := ip_re.match(line.strip()))]
+    except Exception:
+        return []
+
+
 def get_system_resolvers() -> List[str]:
     resolvers: List[str] = []
     sysname = platform.system().lower()
@@ -299,31 +370,39 @@ def get_system_resolvers() -> List[str]:
     if sysname in ("linux", "darwin"):
         resolv = Path("/etc/resolv.conf")
         if resolv.exists():
-            for line in resolv.read_text(errors="ignore").splitlines():
-                line = line.strip()
-                if line.startswith("nameserver"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        resolvers.append(parts[1])
+            resolvers += _parse_resolv_conf(resolv.read_text(errors="ignore"))
+
+        # systemd-resolved stub: resolv.conf only lists 127.0.0.53, which
+        # tells you nothing about the real upstream. Pull those too.
+        stub_only = resolvers and all(r.startswith("127.") for r in resolvers)
+        if stub_only:
+            upstream = Path("/run/systemd/resolve/resolv.conf")
+            if upstream.exists():
+                extra = _parse_resolv_conf(upstream.read_text(errors="ignore"))
+                if extra:
+                    resolvers += extra
 
     elif sysname == "windows":
-      
-        try:
-            out = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
-            ip_re = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
-            in_dns_block = False
-            for line in out.splitlines():
-                if "DNS Servers" in line:
-                    in_dns_block = True
-                elif line.strip() and not line.startswith((" ", "\t")):
-                    in_dns_block = False
+        # PowerShell first: locale-independent. Fall back to parsing
+        # localized ipconfig output.
+        resolvers = _windows_resolvers_powershell()
+        if not resolvers:
+            try:
+                out = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
+                ip_re = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+                in_dns_block = False
+                for line in out.splitlines():
+                    if "DNS Servers" in line:
+                        in_dns_block = True
+                    elif line.strip() and not line.startswith((" ", "\t")):
+                        in_dns_block = False
 
-                if in_dns_block:
-                    m = ip_re.search(line)
-                    if m:
-                        resolvers.append(m.group(1))
-        except Exception:
-            pass
+                    if in_dns_block:
+                        m = ip_re.search(line)
+                        if m:
+                            resolvers.append(m.group(1))
+            except Exception:
+                pass
 
     return list(dict.fromkeys(resolvers))
 
@@ -347,7 +426,8 @@ def dns_diagnostics_menu() -> None:
     if resolvers:
         print("System-configured DNS resolvers:")
         for r in resolvers:
-            print(f"  - {r}")
+            label = label_resolver(r)
+            print(f"  - {r}" + (f"  ({label})" if label else ""))
     else:
         print("Could not reliably parse system resolvers.")
 
@@ -366,14 +446,24 @@ def dns_diagnostics_menu() -> None:
 
 
 SITE_TEMPLATES = [
-    ("GitHub", "https://github.com/{}"),
-    ("GitLab", "https://gitlab.com/{}"),
-    ("Reddit", "https://www.reddit.com/user/{}"),
-    ("Twitter/X", "https://x.com/{}"),
-    ("Instagram", "https://www.instagram.com/{}/"),
-    ("Medium", "https://medium.com/@{}"),
-    ("Dev.to", "https://dev.to/{}"),
+    # (site, url template, reliable_without_login)
+    # reliable=False: the site serves 200/login-wall pages for nonexistent
+    # users, so a "FOUND" from it is not trustworthy anonymously.
+    ("GitHub", "https://github.com/{}", True),
+    ("GitLab", "https://gitlab.com/{}", True),
+    ("Reddit", "https://www.reddit.com/user/{}", True),
+    ("Twitter/X", "https://x.com/{}", False),
+    ("Instagram", "https://www.instagram.com/{}/", False),
+    ("Medium", "https://medium.com/@{}", True),
+    ("Dev.to", "https://dev.to/{}", True),
 ]
+
+# Plain browser UA: a tool-named UA gets blocked far more often, which
+# turns results into UNKNOWN noise.
+HTTP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 @dataclass
@@ -382,52 +472,72 @@ class FootprintResult:
     url: str
     exists: Optional[bool]  # True or False or None (unknown)
     note: str
+    reliable: bool = True  # False = 200 does NOT imply the user exists
 
 
-def _check_site(session, username: str, site: str, tmpl: str, timeout: int = 7) -> FootprintResult:
+def _check_site(username: str, site: str, tmpl: str, reliable: bool, timeout: float = 7.0) -> FootprintResult:
     url = tmpl.format(username)
     try:
-        if session is not None:
-            r = session.get(
-                url, timeout=timeout, allow_redirects=True,
-                headers={"User-Agent": "opsec-toolkit/2.0"},
-            )
+        if requests:
+            # One session per request: requests.Session is NOT thread-safe,
+            # and with only ~7 requests the per-request cost is negligible.
+            with requests.Session() as session:
+                r = session.get(
+                    url, timeout=timeout, allow_redirects=True,
+                    headers={"User-Agent": HTTP_UA},
+                )
             code, final_url = r.status_code, r.url
         else:
             import urllib.request
 
-            req = urllib.request.Request(url, headers={"User-Agent": "opsec-toolkit/2.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 code, final_url = getattr(resp, "status", 200), url
 
         if code == 200:
-            return FootprintResult(site, url, True, f"200 OK ({final_url})")
+            note = f"200 OK ({final_url})"
+            if not reliable:
+                note += " [unreliable anonymously: site may 200 for any name]"
+            return FootprintResult(site, url, True, note, reliable)
         if code == 404:
-            return FootprintResult(site, url, False, "404 Not Found")
+            return FootprintResult(site, url, False, "404 Not Found", reliable)
         if code in (401, 403, 429):
-            return FootprintResult(site, url, None, f"{code} Blocked/Rate-limited")
-        return FootprintResult(site, url, None, f"{code} Unknown")
+            return FootprintResult(site, url, None, f"{code} Blocked/Rate-limited", reliable)
+        return FootprintResult(site, url, None, f"{code} Unknown", reliable)
     except Exception as e:
-        return FootprintResult(site, url, None, f"Error/Blocked: {e}")
+        return FootprintResult(site, url, None, f"Error/Blocked: {e}", reliable)
 
 
-def footprint_check(username: str, max_workers: int = 5) -> List[FootprintResult]:
+def footprint_check(username: str, max_workers: int = 5, timeout: float = 7.0) -> List[FootprintResult]:
     """Check a username against SITE_TEMPLATES concurrently.
 
     max_workers is kept modest by default (5) - this is a small, fixed list
     of sites, so there's no real speed reason to hammer them all at once,
     and a lower concurrency is politer to the sites being checked.
     """
-    session = requests.Session() if requests else None
     results: List[FootprintResult] = []
     with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_check_site, session, username, site, tmpl) for site, tmpl in SITE_TEMPLATES]
+        futures = [
+            ex.submit(_check_site, username, site, tmpl, reliable, timeout)
+            for site, tmpl, reliable in SITE_TEMPLATES
+        ]
         for fut in cf.as_completed(futures):
             results.append(fut.result())
 
-    order = {site: i for i, (site, _) in enumerate(SITE_TEMPLATES)}
+    order = {site: i for i, (site, _, _) in enumerate(SITE_TEMPLATES)}
     results.sort(key=lambda r: order[r.site])
     return results
+
+
+def _print_footprint(results: List[FootprintResult]) -> None:
+    for r in results:
+        status = "FOUND" if r.exists is True else "NOT FOUND" if r.exists is False else "UNKNOWN"
+        print(f"{r.site:12} {status:10} {r.url}  |  {r.note}")
+
+    print("\nNote: UNKNOWN often means the site blocked automated checks. This is not conclusive.")
+    if any(r.exists is True and not r.reliable for r in results):
+        print("Warning: some FOUND results come from sites that answer 200 to anyone "
+              "(login walls). Treat those as unconfirmed.")
 
 
 def footprint_menu() -> None:
@@ -439,12 +549,7 @@ def footprint_menu() -> None:
 
     print(f"Checking footprint for: {username}")
     hr()
-
-    for r in footprint_check(username):
-        status = "FOUND" if r.exists is True else "NOT FOUND" if r.exists is False else "UNKNOWN"
-        print(f"{r.site:12} {status:10} {r.url}  |  {r.note}")
-
-    print("\nNote: UNKNOWN often means the site blocked automated checks. This is not conclusive.")
+    _print_footprint(footprint_check(username))
 
 
 
@@ -476,6 +581,22 @@ def scan_ports(host: str, ports: Sequence[int], timeout: float = 0.4, max_worker
             except Exception:
                 pass
     return sorted(open_ports)
+
+
+def port_service_name(port: int) -> str:
+    """Best-effort IANA service name for a port ('' if unknown)."""
+    try:
+        return socket.getservbyport(port)
+    except (OSError, OverflowError):
+        return ""
+
+
+def format_open_ports(open_ports: Sequence[int]) -> str:
+    parts = []
+    for p in open_ports:
+        svc = port_service_name(p)
+        parts.append(f"{p} ({svc})" if svc else str(p))
+    return ", ".join(parts)
 
 
 def local_scan_menu() -> None:
@@ -510,7 +631,7 @@ def local_scan_menu() -> None:
     hr()
     if open_ports:
         print("Open ports:")
-        print(", ".join(map(str, open_ports)))
+        print(format_open_ports(open_ports))
     else:
         print("No open ports found (or filtered).")
 
@@ -573,6 +694,24 @@ def parse_port_range(spec: str) -> List[int]:
     return list(range(a, b + 1))
 
 
+def parse_port_list(spec: str) -> List[int]:
+    """Parse '22,80,443' (commas, optional spaces) into a sorted port list."""
+    ports: List[int] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if not chunk.isdigit():
+            raise argparse.ArgumentTypeError(f"invalid port: {chunk!r}")
+        p = int(chunk)
+        if not (1 <= p <= 65535):
+            raise argparse.ArgumentTypeError(f"port out of range 1-65535: {p}")
+        ports.append(p)
+    if not ports:
+        raise argparse.ArgumentTypeError("empty port list")
+    return sorted(set(ports))
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="opsec_toolkit.py",
@@ -595,11 +734,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     fp_p = sub.add_parser("footprint", help="Check a username across common platforms")
     fp_p.add_argument("username")
     fp_p.add_argument("-w", "--workers", type=int, default=5, help="Concurrent requests (default 5)")
+    fp_p.add_argument("-t", "--timeout", type=float, default=7.0, help="Per-site timeout in seconds (default 7)")
 
     scan_p = sub.add_parser("scan", help="Scan TCP ports on a host")
     scan_p.add_argument("--host", default="127.0.0.1")
-    scan_p.add_argument("--range", type=parse_port_range, dest="ports",
-                         help="Port range as START-END, e.g. 1-1024 (default: common ports)")
+    scan_p.add_argument("--range", type=parse_port_range, dest="ports_range",
+                          help="Port range as START-END, e.g. 1-1024 (default: common ports)")
+    scan_p.add_argument("--ports", type=parse_port_list, dest="ports_list",
+                          help="Explicit port list, e.g. 22,80,443 (overrides --range)")
     scan_p.add_argument("-w", "--workers", type=int, default=100, help="Concurrent connections (default 100)")
     scan_p.add_argument("-t", "--timeout", type=float, default=0.4, help="Per-port timeout in seconds")
 
@@ -624,7 +766,11 @@ def run_cli(args: argparse.Namespace) -> int:
         if not args.yes and not confirm(f"Shred and permanently delete '{args.file}'?"):
             print("Aborted.")
             return 1
-        result = shred_file(Path(args.file), passes=max(1, args.passes))
+        passes = max(1, args.passes)
+        if passes > SHRED_MAX_PASSES:
+            print(f"NOTE: {passes} passes is overkill on modern storage; clamping to {SHRED_MAX_PASSES}.")
+            passes = SHRED_MAX_PASSES
+        result = shred_file(Path(args.file), passes=passes)
         print(result.message if result.ok else f"ERROR: {result.message}")
         return 0 if result.ok else 1
 
@@ -635,17 +781,26 @@ def run_cli(args: argparse.Namespace) -> int:
     if args.command == "footprint":
         print(f"Checking footprint for: {args.username}")
         hr()
-        for r in footprint_check(args.username, max_workers=max(1, args.workers)):
-            status = "FOUND" if r.exists is True else "NOT FOUND" if r.exists is False else "UNKNOWN"
-            print(f"{r.site:12} {status:10} {r.url}  |  {r.note}")
+        _print_footprint(
+            footprint_check(
+                args.username,
+                max_workers=max(1, args.workers),
+                timeout=max(1.0, args.timeout),
+            )
+        )
         return 0
 
     if args.command == "scan":
-        ports = args.ports or COMMON_PORTS
+        if args.ports_list:
+            ports = args.ports_list
+        elif args.ports_range:
+            ports = args.ports_range
+        else:
+            ports = COMMON_PORTS
         print(f"Scanning {args.host} on {len(ports)} port(s)...")
         open_ports = scan_ports(args.host, ports, timeout=args.timeout, max_workers=args.workers)
         if open_ports:
-            print("Open ports:", ", ".join(map(str, open_ports)))
+            print("Open ports:", format_open_ports(open_ports))
         else:
             print("No open ports found (or filtered).")
         return 0
